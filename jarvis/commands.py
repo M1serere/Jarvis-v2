@@ -6,6 +6,8 @@ from enum import Enum
 import re
 from urllib.parse import urlencode
 
+from .personal import LocalCommand, QUESTIONS, parse_local
+
 
 class Mode(str, Enum):
     WAITING = "waiting"
@@ -21,6 +23,7 @@ class Intent(str, Enum):
     ASK_CITY = "ask_city"
     ASK_TOPIC = "ask_topic"
     UNKNOWN = "unknown"
+    LOCAL = "local"
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,7 @@ class Action:
     intent: Intent
     message: str = ""
     url: str = ""
+    command: LocalCommand | None = None
 
 
 def normalize(text: str) -> str:
@@ -50,17 +54,20 @@ class Assistant:
         self.mode = Mode.WAITING
         self.pending: Intent | None = None
         self._pending_weather = ""
+        self._pending_local: str | None = None
 
     def activate(self) -> Action:
         self.mode = Mode.ACTIVE
         self.pending = None
         self._pending_weather = ""
+        self._pending_local = None
         return Action(Intent.ACTIVATE, "Слушаю команду")
 
     def sleep(self) -> Action:
         self.mode = Mode.WAITING
         self.pending = None
         self._pending_weather = ""
+        self._pending_local = None
         return Action(Intent.SLEEP, "Жду обращения «Джарвис»")
 
     def handle(self, text: str) -> Action:
@@ -70,6 +77,8 @@ class Assistant:
         words = phrase.split()
         addressed = words[0] in self.wake_words
         body = " ".join(words[1:]) if addressed else phrase
+        # Заметки и дела сохраняют регистр, знаки препинания и переносы строк.
+        raw_body = re.sub(r"^[\W_]*[^\W_]+[\W_]*", "", text, count=1) if addressed else text.strip()
         # Проверяем всю законченную фразу до активации. «Джарвис, спасибо»
         # не должен повторно будить помощника или выполнять хвост команды.
         sleep_phrases = {"спасибо", "спасибо большое", "большое спасибо", "стоп", "остановись", "в ожидание"}
@@ -85,7 +94,14 @@ class Assistant:
         if body in {"отмена", "отмени"}:
             self.pending = None
             self._pending_weather = ""
+            self._pending_local = None
             return Action(Intent.ACTIVATE, "Отменено. Слушаю команду")
+
+        local = parse_local(raw_body)
+        if local:
+            return self._local(local)
+        if self.pending == Intent.LOCAL and self._pending_local:
+            return self._local(LocalCommand(self._pending_local, raw_body))
 
         weather_match = re.search(r"\b(?:погода|погоду|погоде|погоды|прогноз)\b", body)
         news_match = re.search(r"\b(?:новости|новостей)\b", body)
@@ -102,6 +118,9 @@ class Assistant:
         if news_match:
             self.pending = None
             return self._news(body, news_match)
+        local = parse_local(raw_body, generic_program=True)
+        if local:
+            return self._local(local)
         if self.pending == Intent.ASK_TOPIC:
             self.pending = None
             return self._open_news(self._strip_topic_prefix(body))
@@ -111,7 +130,17 @@ class Assistant:
             query = " ".join(part for part in (self._pending_weather, city) if part)
             self._pending_weather = ""
             return Action(Intent.WEATHER, f"Открываю прогноз: {query}", weather_url(query))
-        return Action(Intent.UNKNOWN, "Не понял команду. Попробуй «Покажи погоду» или «Новости про музыку».")
+        return Action(Intent.UNKNOWN, "Не понял команду. Примеры: «Создай заметку …», «Добавь дело …», «Таймер на 5 минут», «Покажи погоду». Все команды — в меню «Помощь».")
+
+    def _local(self, command: LocalCommand) -> Action:
+        self.pending = None
+        self._pending_weather = ""
+        self._pending_local = None
+        if command.operation in QUESTIONS and not command.argument:
+            self.pending = Intent.LOCAL
+            self._pending_local = command.operation
+            return Action(Intent.LOCAL, QUESTIONS[command.operation])
+        return Action(Intent.LOCAL, command=command)
 
     def _weather(self, body: str) -> Action:
         # Сохраняем произвольный город, дату и уточнения, удаляем только

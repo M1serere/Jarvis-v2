@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 import logging
+from pathlib import Path
 import queue
+import sqlite3
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -13,23 +15,32 @@ import zipfile
 from .browser import BrowserError, open_in_chrome
 from .commands import Action, Assistant, Intent, Mode
 from .config import CONFIG_PATH, ROOT, Settings, save_settings
+from .data_ui import DataWindow
+from .personal import LocalCommand, PersonalService, PersonalStore, display_time
 from .voice import VoiceEvent, VoiceWorker, list_microphones
 
 
 class JarvisWindow:
-    def __init__(self, root: tk.Tk, settings: Settings, logger: logging.Logger, demo: bool = False):
+    def __init__(self, root: tk.Tk, settings: Settings, logger: logging.Logger, demo: bool = False,
+                 data_path: Path | str | None = None):
         self.root = root
         self.settings = settings
         self.logger = logger
         self.demo = demo
         self.assistant = Assistant(settings.city, settings.wake_words)
+        # DEMO никогда не изменяет настоящие заметки и напоминания.
+        self.store = PersonalStore(":memory:" if demo else data_path or ROOT / "data/jarvis.sqlite3")
+        self.personal = PersonalService(self.store, demo=demo)
         self.events: queue.Queue[VoiceEvent] = queue.Queue()
         self.voice: VoiceWorker | None = None
         self.epoch = 0
-        self.ready = demo
+        self.ready = True  # Текстовые команды доступны независимо от микрофона.
+        self.voice_error = ""
         self.closing = False
         self._log_window: tk.Toplevel | None = None
         self._settings_window: tk.Toplevel | None = None
+        self._data_window: DataWindow | None = None
+        self._notification_window: tk.Toplevel | None = None
         self._request = 0
         self._jobs: set[int] = set()
         self._cancelled_jobs: set[int] = set()
@@ -38,17 +49,17 @@ class JarvisWindow:
         root.report_callback_exception = self._ui_exception
         self.logger.info("Запуск; режим=%s", "demo" if demo else "voice")
         if demo:
-            self._show_mode("Демонстрация: микрофон выключен")
+            self._show_mode("DEMO: данные временные, микрофон выключен, программы не запускаются.")
         else:
-            self.button.configure(state="disabled")
             self.voice = VoiceWorker(settings, self.events, logger)
             self.voice.start()
-        self.root.after(70, self._poll)
+        self._poll_after = self.root.after(70, self._poll)
+        self._alarm_after = self.root.after(0, lambda: self._check_alarms(startup=True))
 
     def _build(self) -> None:
         self.root.title("Джарвис · прототип" + (" · DEMO" if self.demo else ""))
-        self.root.geometry("540x420" if self.demo else "540x350")
-        self.root.minsize(480, 330 if self.demo else 310)
+        self.root.geometry("720x650")
+        self.root.minsize(610, 540)
         self.root.configure(background="#101822")
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
@@ -56,10 +67,15 @@ class JarvisWindow:
         style.configure("Activate.TButton", font=("Segoe UI", 12), padding=(22, 12))
         menu = tk.Menu(self.root)
         menu.add_command(label="Настройки", command=self.show_settings)
+        data_menu = tk.Menu(menu, tearoff=False)
+        for tab, label in (("notes", "Заметки"), ("tasks", "Список дел"), ("alarms", "Таймеры и напоминания"), ("programs", "Программы")):
+            data_menu.add_command(label=label, command=lambda selected=tab: self.show_data(selected))
+        menu.add_cascade(label="Мои данные", menu=data_menu)
         logs = tk.Menu(menu, tearoff=False)
         logs.add_command(label="Открыть журнал", command=self.show_logs)
         logs.add_command(label="Выгрузить ZIP", command=self.export_logs)
         menu.add_cascade(label="Логи", menu=logs)
+        menu.add_command(label="Помощь", command=self.show_help)
         menu.add_command(label="Выход", command=self.close)
         self.root.configure(menu=menu)
 
@@ -72,29 +88,35 @@ class JarvisWindow:
         self.indicator.pack()
         self.status = tk.StringVar(value="Загружаю распознавание…")
         tk.Label(frame, textvariable=self.status, font=("Segoe UI", 12), fg="#e6eff9",
-                 background="#101822", wraplength=465).pack(pady=(5, 12))
+                 background="#101822", wraplength=560).pack(pady=(5, 12))
         self.button = ttk.Button(frame, text="Активировать", style="Activate.TButton", command=self.toggle)
         self.button.pack()
         self.detail = tk.StringVar(value="После обращения сделай короткую паузу.")
         tk.Label(frame, textvariable=self.detail, font=("Segoe UI", 10), fg="#aab9cc",
-                 background="#101822", wraplength=465, justify="center").pack(pady=(12, 6))
+                 background="#101822", wraplength=610, justify="center").pack(pady=(12, 6))
         self.last_phrase = tk.StringVar(value="Команда: —")
         tk.Label(frame, textvariable=self.last_phrase, font=("Segoe UI", 9), fg="#8395ab",
-                 background="#101822", wraplength=465).pack()
-        if self.demo:
-            demo_frame = tk.Frame(frame, background="#101822")
-            demo_frame.pack(fill="x", pady=(12, 0))
-            self.demo_input = ttk.Entry(demo_frame)
-            self.demo_input.pack(side="left", fill="x", expand=True)
-            self.demo_input.bind("<Return>", lambda event: self._submit_demo())
-            ttk.Button(demo_frame, text="Отправить", command=self._submit_demo).pack(side="left", padx=(8, 0))
-            self.demo_input.focus_set()
+                 background="#101822", wraplength=610).pack()
+        self.history = ScrolledText(frame, height=12, wrap="word", font=("Segoe UI", 10),
+                                    background="#172332", foreground="#e6eff9", insertbackground="white", state="disabled")
+        self.history.pack(fill="both", expand=True, pady=(12, 0))
+        input_frame = tk.Frame(frame, background="#101822")
+        input_frame.pack(fill="x", pady=(12, 0))
+        self.text_input = ttk.Entry(input_frame)
+        self.demo_input = self.text_input
+        self.text_input.pack(side="left", fill="x", expand=True)
+        self.text_input.bind("<Return>", lambda event: self._submit_demo())
+        ttk.Button(input_frame, text="Отправить", command=self._submit_demo).pack(side="left", padx=(8, 0))
+        self.text_input.focus_set()
+        self._append_history("Джарвис", "Введи команду или скажи «Джарвис». Примеры команд — в меню «Помощь».")
 
     def _show_mode(self, message: str = "") -> None:
         active = self.assistant.mode == Mode.ACTIVE
         self.indicator.itemconfigure(self.dot, fill="#59d9a0" if active else "#8395ab")
         self.status.set("Слушаю команду" if active else "Жду обращения «Джарвис»")
         self.button.configure(text="В ожидание" if active else "Активировать")
+        if self.voice_error:
+            self.status.set(self.status.get() + " · только текст")
         if message:
             self.detail.set(message)
 
@@ -124,9 +146,24 @@ class JarvisWindow:
             self.root.bell()
 
     def _submit_demo(self) -> None:
-        text = self.demo_input.get()
-        self.demo_input.delete(0, "end")
+        text = self.text_input.get()
+        self.text_input.delete(0, "end")
+        if not text.strip() or self.closing:
+            return
+        if self.assistant.mode == Mode.WAITING:
+            self.assistant.activate()
+            self._new_epoch()
         self.handle_phrase(text)
+
+    def _append_history(self, speaker: str, text: str) -> None:
+        if not text:
+            return
+        self.history.configure(state="normal")
+        self.history.insert("end", f"{speaker}: {text}\n\n")
+        if int(self.history.index("end-1c").split(".")[0]) > 2000:
+            self.history.delete("1.0", "800.0")
+        self.history.configure(state="disabled")
+        self.history.see("end")
 
     def handle_phrase(self, text: str) -> None:
         if self.closing or not self.ready:
@@ -136,6 +173,7 @@ class JarvisWindow:
         if action.intent == Intent.IGNORE:
             return  # Обычная речь в ожидании не сохраняется и не показывается.
         self.last_phrase.set("Команда: " + text[:220])
+        self._append_history("Ты", text)
         self._request += 1
         request = self._request
         self.logger.info("Запрос #%s; текст=%r; действие=%s; состояние=%s", request, text,
@@ -149,6 +187,9 @@ class JarvisWindow:
         elif action.intent == Intent.ACTIVATE:
             self._new_epoch()
         self._show_mode(action.message)
+        self._append_history("Джарвис", action.message)
+        if action.command:
+            self.run_local(action.command)
         if action.url:
             if self.demo:
                 self.detail.set("DEMO: открылся бы Chrome. Адрес записан в логи.")
@@ -157,6 +198,101 @@ class JarvisWindow:
                 self._jobs.add(request)
                 threading.Thread(target=self._open_page, args=(action, request),
                                  name=f"jarvis-browser-{request}", daemon=True).start()
+
+    def run_local(self, command: LocalCommand) -> bool:
+        if self.closing:
+            return False
+        try:
+            message = self.personal.execute(command)
+            self.logger.info("Личная команда=%s; результат=%s", command.operation, message)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            message = f"Не выполнено: {exc}"
+            self.logger.error("Личная команда=%s; %s", command.operation, message)
+            self.detail.set(message)
+            self._append_history("Джарвис", message)
+            return False
+        self.detail.set(message.splitlines()[0][:250])
+        self._append_history("Джарвис", message)
+        if self._data_window and self._data_window.window.winfo_exists():
+            self._data_window.refresh()
+        return True
+
+    def show_data(self, tab: str = "notes") -> None:
+        if self._data_window is None or not self._data_window.window.winfo_exists():
+            self._data_window = DataWindow(self.root, self.store, self.run_local, self.logger)
+        self._data_window.refresh()
+        self._data_window.select(tab)
+
+    def show_help(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Команды Джарвиса")
+        window.geometry("680x510")
+        text = ScrolledText(window, wrap="word", font=("Segoe UI", 11), padx=16, pady=16)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", """Голосом сначала скажи «Джарвис». В текстовой строке можно сразу вводить команду.
+
+Создай заметку: Купить корм, 2 пакета.
+Покажи заметки / Прочитай заметку 1
+Добавь дело записаться к врачу
+Покажи список дел / Отметь дело 1
+Таймер на пять минут чай
+Поставь таймер на 1 час 30 минут
+Напомни через десять минут проверить духовку
+Напомни завтра в 09:30 позвонить
+Напомни 25.10.2026 в 18:00 забрать заказ
+Покажи таймеры / Покажи напоминания
+Отмени таймер 1 / Отмени напоминание 2
+Покажи программы / Открой программу Блокнот
+Покажи погоду / Новости про музыку
+Отмена — сбросить уточнение
+Джарвис спасибо — ждать кодовое слово
+
+Номера показаны в ответах и меню «Мои данные». Там же можно добавить программу, выбрав её .exe-файл.
+
+Таймеры и напоминания показываются в отдельном окне со звуковым сигналом, в том числе в режиме ожидания имени. При закрытом Джарвисе они не срабатывают; просроченные записи появятся при следующем запуске. Время — местное время Windows.
+
+Заметки, дела и напоминания хранятся в data/jarvis.sqlite3. DEMO использует временную базу, которая исчезает при закрытии. Озвучивания ответов пока нет.""")
+        text.configure(state="disabled")
+
+    def _check_alarms(self, startup: bool = False) -> None:
+        if self.closing:
+            return
+        self.root.after_cancel(self._alarm_after)
+        try:
+            now = self.personal.clock()
+            due = self.store.due(now)
+            if due:
+                messages = []
+                for row in due:
+                    title = "Пропущено" if startup else "Таймер завершён" if row["kind"] == "timer" else "Напоминание"
+                    messages.append(f"{title} №{row['id']} · {display_time(row['due_at'])}\n{row['text']}")
+                self._show_notifications("\n\n".join(messages))
+                for row in due:
+                    self.store.mark_delivered(row["id"], now)
+                    self.logger.info("Уведомление #%s; пропущено=%s; текст=%s", row["id"], startup, row["text"])
+                if self._data_window and self._data_window.window.winfo_exists():
+                    self._data_window.refresh()
+        except (OSError, sqlite3.Error) as exc:
+            self.logger.error("Проверка напоминаний: %s", exc)
+            self.detail.set("Не удалось проверить напоминания. Подробности в логах.")
+        self._alarm_after = self.root.after(1000, self._check_alarms)
+
+    def _show_notifications(self, message: str) -> None:
+        if self._notification_window is None or not self._notification_window.winfo_exists():
+            window = self._notification_window = tk.Toplevel(self.root)
+            window.title("Напоминания · Джарвис")
+            window.geometry("580x340")
+            self.notification_text = ScrolledText(window, wrap="word", font=("Segoe UI", 12), state="disabled")
+            self.notification_text.pack(fill="both", expand=True, padx=14, pady=14)
+            ttk.Button(window, text="Закрыть", command=window.destroy).pack(pady=(0, 12))
+        self.notification_text.configure(state="normal")
+        self.notification_text.insert("end", message + "\n\n")
+        self.notification_text.configure(state="disabled")
+        self.notification_text.see("end")
+        self._notification_window.deiconify()
+        self._notification_window.lift()
+        self.root.bell()
+        self._append_history("Уведомление", message)
 
     def _open_page(self, action: Action, request: int) -> None:
         try:
@@ -176,6 +312,7 @@ class JarvisWindow:
     def _poll(self) -> None:
         if self.closing:
             return
+        self.root.after_cancel(self._poll_after)
         for _ in range(40):
             try:
                 event = self.events.get_nowait()
@@ -183,19 +320,17 @@ class JarvisWindow:
                 break
             if event.kind == "ready":
                 self.ready = True
+                self.voice_error = ""
                 self.button.configure(state="normal")
                 self._show_mode("Микрофон: " + event.text)
             elif event.kind == "phrase" and event.epoch == self.epoch:
                 self.handle_phrase(event.text)
             elif event.kind == "error":
-                self.ready = False
-                self.assistant.sleep()
-                self._cancel_jobs()
-                self._new_epoch()
+                self.voice_error = event.text
                 self.indicator.itemconfigure(self.dot, fill="#f37e82")
-                self.status.set("Голосовой ввод недоступен")
+                self.status.set("Голосовой ввод недоступен · текст работает")
                 self.detail.set(event.text)
-                self.button.configure(state="disabled", text="Активировать")
+                self._append_history("Джарвис", event.text + " Можно вводить команды в текстовую строку.")
             elif event.kind == "warning":
                 self.detail.set(event.text)
             elif event.kind.startswith("browser_"):
@@ -204,7 +339,8 @@ class JarvisWindow:
                 self._cancelled_jobs.discard(event.epoch)
                 if not cancelled and event.epoch == self._request and self.assistant.mode == Mode.ACTIVE:
                     self.detail.set(event.text)
-        self.root.after(70, self._poll)
+                    self._append_history("Джарвис", event.text)
+        self._poll_after = self.root.after(70, self._poll)
 
     def show_settings(self) -> None:
         if self._settings_window and self._settings_window.winfo_exists():
@@ -320,6 +456,8 @@ class JarvisWindow:
         if self.closing:
             return
         self.closing = True
+        self.root.after_cancel(self._poll_after)
+        self.root.after_cancel(self._alarm_after)
         self.ready = False
         self.assistant.sleep()
         self._cancel_jobs()
@@ -336,4 +474,5 @@ class JarvisWindow:
             self.root.after(50, self._finish_close)
             return
         self.logger.info("Полное завершение приложения")
+        self.store.close()
         self.root.destroy()

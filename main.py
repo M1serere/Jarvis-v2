@@ -33,8 +33,8 @@ def check_installation(settings) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Джарвис: локальное распознавание, погода и новости в Chrome")
-    parser.add_argument("--demo", action="store_true", help="Ввод с клавиатуры, без микрофона и открытия браузера")
+    parser = argparse.ArgumentParser(description="Джарвис: голос, заметки, дела, напоминания и программы")
+    parser.add_argument("--demo", action="store_true", help="Демонстрация: временные данные, без микрофона, браузера и запуска программ")
     parser.add_argument("--list-microphones", action="store_true", help="Показать доступные устройства ввода")
     parser.add_argument("--check", action="store_true", help="Проверить установку без открытия микрофона")
     args = parser.parse_args()

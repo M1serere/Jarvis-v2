@@ -7,4 +7,5 @@ models/*
 logs/*
 !logs/.gitkeep
 config.json
+data/
 *.zip
