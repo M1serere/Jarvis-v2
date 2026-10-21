@@ -1,0 +1,8 @@
+{
+  "city": "",
+  "model_path": "models/vosk-model-small-ru-0.22",
+  "chrome_path": "",
+  "microphone": null,
+  "wake_words": ["джарвис"],
+  "activation_sound": true
+}

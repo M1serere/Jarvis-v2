@@ -1,0 +1,10 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+models/*
+!models/.gitkeep
+logs/*
+!logs/.gitkeep
+config.json
+*.zip
