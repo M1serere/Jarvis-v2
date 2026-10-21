@@ -9,3 +9,5 @@ logs/*
 config.json
 data/
 *.zip
+tools/ollama/
+models/ollama/

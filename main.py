@@ -37,6 +37,7 @@ def main() -> int:
     parser.add_argument("--demo", action="store_true", help="Демонстрация: временные данные, без микрофона, браузера и запуска программ")
     parser.add_argument("--list-microphones", action="store_true", help="Показать доступные устройства ввода")
     parser.add_argument("--check", action="store_true", help="Проверить установку без открытия микрофона")
+    parser.add_argument("--check-model", action="store_true", help="Проверить локальную модель без микрофона")
     args = parser.parse_args()
     logger = configure_logging(ROOT)
     install_thread_error_handler(logger)
@@ -51,6 +52,17 @@ def main() -> int:
             return 1
     try:
         settings = load_settings()
+        if args.check_model:
+            from jarvis.llm import OllamaClient
+            from jarvis.model_runtime import ModelRuntime
+            runtime = ModelRuntime(ROOT)
+            try:
+                client = OllamaClient(settings.llm_url, settings.llm_model, settings.llm_timeout)
+                runtime.ensure(client)
+                print(client.check())
+                return 0
+            finally:
+                runtime.close()
         if args.check:
             return check_installation(settings)
         import tkinter as tk
@@ -63,7 +75,7 @@ def main() -> int:
         logger.exception("Ошибка запуска")
         if sys.stderr:
             print(f"Не удалось запустить Джарвиса: {exc}", file=sys.stderr)
-        if not args.check:
+        if not args.check and not args.check_model:
             try:
                 import tkinter as tk
                 from tkinter import messagebox

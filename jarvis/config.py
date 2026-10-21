@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+from .llm import DEFAULT_PERSONALITY, validate_endpoint, validate_model
+
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.json"
@@ -18,6 +20,11 @@ class Settings:
     microphone: int | str | None = None
     wake_words: list[str] = field(default_factory=lambda: ["джарвис"])
     activation_sound: bool = True
+    llm_enabled: bool = True
+    llm_url: str = "http://127.0.0.1:11434"
+    llm_model: str = "qwen3:1.7b"
+    llm_timeout: int = 90
+    personality: str = DEFAULT_PERSONALITY
 
     @property
     def model_directory(self) -> Path:
@@ -45,6 +52,17 @@ class Settings:
             raise ValueError("Номер микрофона не может быть отрицательным.")
         if not isinstance(self.activation_sound, bool):
             raise ValueError("activation_sound должен быть true или false.")
+        if not isinstance(self.llm_enabled, bool):
+            raise ValueError("llm_enabled должен быть true или false.")
+        if not isinstance(self.llm_url, str):
+            raise ValueError("llm_url должен быть строкой.")
+        validate_endpoint(self.llm_url)
+        validate_model(self.llm_model)
+        if isinstance(self.llm_timeout, bool) or not isinstance(self.llm_timeout, int) or not 10 <= self.llm_timeout <= 300:
+            raise ValueError("Таймаут модели: целое число от 10 до 300 секунд.")
+        if not isinstance(self.personality, str) or not 1 <= len(self.personality.strip()) <= 3000:
+            raise ValueError("Описание характера: от 1 до 3000 символов.")
+        self.personality = self.personality.strip()
 
 
 def load_settings(path: Path = CONFIG_PATH) -> Settings:

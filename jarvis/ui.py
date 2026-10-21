@@ -17,6 +17,8 @@ from .commands import Action, Assistant, Intent, Mode
 from .config import CONFIG_PATH, ROOT, Settings, save_settings
 from .data_ui import DataWindow
 from .personal import LocalCommand, PersonalService, PersonalStore, display_time
+from .llm import ModelError, ModelEvent, OllamaClient, build_messages
+from .model_runtime import ModelRuntime
 from .voice import VoiceEvent, VoiceWorker, list_microphones
 
 
@@ -31,7 +33,7 @@ class JarvisWindow:
         # DEMO никогда не изменяет настоящие заметки и напоминания.
         self.store = PersonalStore(":memory:" if demo else data_path or ROOT / "data/jarvis.sqlite3")
         self.personal = PersonalService(self.store, demo=demo)
-        self.events: queue.Queue[VoiceEvent] = queue.Queue()
+        self.events: queue.Queue[VoiceEvent | ModelEvent] = queue.Queue()
         self.voice: VoiceWorker | None = None
         self.epoch = 0
         self.ready = True  # Текстовые команды доступны независимо от микрофона.
@@ -44,6 +46,11 @@ class JarvisWindow:
         self._request = 0
         self._jobs: set[int] = set()
         self._cancelled_jobs: set[int] = set()
+        self.model_runtime = ModelRuntime(ROOT)
+        self._model_client: OllamaClient | None = None
+        self._model_request: int | None = None
+        self._model_text = ""
+        self._conversation: list[dict[str, str]] = []
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.report_callback_exception = self._ui_exception
@@ -76,6 +83,7 @@ class JarvisWindow:
         logs.add_command(label="Выгрузить ZIP", command=self.export_logs)
         menu.add_cascade(label="Логи", menu=logs)
         menu.add_command(label="Помощь", command=self.show_help)
+        menu.add_command(label="Новый разговор", command=self.reset_conversation)
         menu.add_command(label="Выход", command=self.close)
         self.root.configure(menu=menu)
 
@@ -127,6 +135,26 @@ class JarvisWindow:
 
     def _cancel_jobs(self) -> None:
         self._cancelled_jobs.update(self._jobs)
+        self._cancel_model()
+
+    def _cancel_model(self) -> None:
+        if self._model_client:
+            self._model_client.cancel()
+        self._model_client = None
+        self._model_request = None
+
+    def reset_conversation(self) -> None:
+        self._cancel_model()
+        self._conversation.clear()
+        self.assistant.activate()
+        self._new_epoch()
+        self._show_mode("Начинаем новый разговор. Контекст модели очищен.")
+        self._append_history("Джарвис", "Начинаем новый разговор. Контекст модели очищен.")
+
+    def _remember(self, text: str, answer: str) -> None:
+        self._conversation.extend([{"role": "user", "content": text[:4000]},
+                                   {"role": "assistant", "content": answer[:4000]}])
+        self._conversation = self._conversation[-12:]
 
     def toggle(self) -> None:
         if not self.ready or self.closing:
@@ -172,6 +200,7 @@ class JarvisWindow:
         action = self.assistant.handle(text)
         if action.intent == Intent.IGNORE:
             return  # Обычная речь в ожидании не сохраняется и не показывается.
+        self._cancel_model()  # Новая команда отменяет ещё не принятый ответ модели.
         self.last_phrase.set("Команда: " + text[:220])
         self._append_history("Ты", text)
         self._request += 1
@@ -186,10 +215,17 @@ class JarvisWindow:
                 self._cancel_jobs()
         elif action.intent == Intent.ACTIVATE:
             self._new_epoch()
+        if action.intent == Intent.UNKNOWN:
+            self._start_model(text)
+            return
         self._show_mode(action.message)
         self._append_history("Джарвис", action.message)
         if action.command:
             self.run_local(action.command)
+        elif action.intent not in {Intent.ACTIVATE, Intent.SLEEP}:
+            self._remember(text, action.message)
+        if action.intent in {Intent.ACTIVATE, Intent.SLEEP}:
+            self._conversation.clear()
         if action.url:
             if self.demo:
                 self.detail.set("DEMO: открылся бы Chrome. Адрес записан в логи.")
@@ -199,20 +235,87 @@ class JarvisWindow:
                 threading.Thread(target=self._open_page, args=(action, request),
                                  name=f"jarvis-browser-{request}", daemon=True).start()
 
+    def _start_model(self, text: str) -> None:
+        if self.demo or not self.settings.llm_enabled:
+            message = ("DEMO: модель не вызывается. Для разговора запусти run.cmd. " if self.demo else "Локальная модель выключена в настройках. ")
+            message += "Готовые команды доступны в меню «Помощь»."
+            self._show_mode(message)
+            self._append_history("Джарвис", message)
+            return
+        if len(text) > 4000:
+            self._show_mode("Запрос слишком длинный. Используй до 4000 символов.")
+            return
+        client = OllamaClient(self.settings.llm_url, self.settings.llm_model, self.settings.llm_timeout)
+        self._model_client = client
+        self._model_request, self._model_text = self._request, text
+        messages = build_messages(self.settings.personality, self._conversation, text,
+                                  [row["name"] for row in self.store.programs()])
+        request, runtime, events, logger = self._request, self.model_runtime, self.events, self.logger
+        self._show_mode("Думаю… Готовые команды и «Отмена» доступны.")
+        self.status.set("Думаю · " + self.settings.llm_model)
+
+        def work() -> None:
+            from time import monotonic
+            started = monotonic()
+            try:
+                runtime.ensure(client)
+                reply = client.reply(messages)
+                logger.info("Модель; запрос #%s; тип=%s; время=%.2f с", request, reply.kind, monotonic() - started)
+                events.put(ModelEvent("model_reply", "", request, reply))
+            except ModelError as exc:
+                logger.warning("Модель; запрос #%s; время=%.2f с; %s", request, monotonic() - started, exc)
+                events.put(ModelEvent("model_error", str(exc), request))
+            except Exception:
+                logger.exception("Ошибка модели; запрос #%s", request)
+                events.put(ModelEvent("model_error", "Ошибка локальной модели. Подробности в логах; готовые команды работают.", request))
+
+        threading.Thread(target=work, name=f"jarvis-model-{request}", daemon=True).start()
+
+    def _accept_model(self, event: ModelEvent) -> None:
+        if event.epoch != self._model_request or self.assistant.mode != Mode.ACTIVE:
+            return
+        text = self._model_text
+        self._model_client = None
+        self._model_request = None
+        if event.kind == "model_error":
+            self._show_mode(event.text)
+            self._append_history("Джарвис", event.text)
+            return
+        reply = event.reply
+        if reply is None:
+            return
+        if reply.command:
+            # Повторно применяем правила готовых команд, включая вопросы о параметрах.
+            action = self.assistant._local(reply.command)
+            if action.command:
+                self.run_local(action.command)
+                return
+            message = action.message
+        else:
+            message = reply.message
+        self.logger.info("Ответ модели; запрос #%s; тип=%s; текст=%r", event.epoch, reply.kind, message)
+        self._remember(text, message)
+        self._show_mode(message.splitlines()[0][:250])
+        self._append_history("Джарвис", message)
+
     def run_local(self, command: LocalCommand) -> bool:
         if self.closing:
             return False
+        self._cancel_model()
         try:
             message = self.personal.execute(command)
             self.logger.info("Личная команда=%s; результат=%s", command.operation, message)
         except (ValueError, OSError, sqlite3.Error) as exc:
             message = f"Не выполнено: {exc}"
             self.logger.error("Личная команда=%s; %s", command.operation, message)
-            self.detail.set(message)
+            self._show_mode(message)
             self._append_history("Джарвис", message)
+            self._remember(f"Команда {command.operation}: {command.argument}", message)
             return False
         self.detail.set(message.splitlines()[0][:250])
         self._append_history("Джарвис", message)
+        self._remember(f"Команда {command.operation}: {command.argument}", message)
+        self._show_mode(message.splitlines()[0][:250])
         if self._data_window and self._data_window.window.winfo_exists():
             self._data_window.refresh()
         return True
@@ -251,7 +354,16 @@ class JarvisWindow:
 
 Таймеры и напоминания показываются в отдельном окне со звуковым сигналом, в том числе в режиме ожидания имени. При закрытом Джарвисе они не срабатывают; просроченные записи появятся при следующем запуске. Время — местное время Windows.
 
-Заметки, дела и напоминания хранятся в data/jarvis.sqlite3. DEMO использует временную базу, которая исчезает при закрытии. Озвучивания ответов пока нет.""")
+Заметки, дела и напоминания хранятся в data/jarvis.sqlite3. DEMO использует временную базу, которая исчезает при закрытии. Озвучивания ответов пока нет.
+
+Локальная модель — пункт 4:
+Запусти setup-model.cmd один раз для загрузки Ollama и Qwen3.
+После этого можно писать свободно: «Привет, как ты?», «Что тебе интересно?»,
+«Я поставила пирог, пни меня минут через тридцать».
+Если данных не хватает, Джарвис уточнит. Готовые команды работают без модели.
+«Отмена», «Джарвис, стоп» и новая команда отменяют текущий ответ модели.
+Меню «Новый разговор» очищает её контекст. Контекст хранится только до закрытия.
+Модель и характер настраиваются в меню «Настройки». В DEMO модель отключена.""")
         text.configure(state="disabled")
 
     def _check_alarms(self, startup: bool = False) -> None:
@@ -318,7 +430,9 @@ class JarvisWindow:
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
-            if event.kind == "ready":
+            if event.kind.startswith("model_"):
+                self._accept_model(event)
+            elif event.kind == "ready":
                 self.ready = True
                 self.voice_error = ""
                 self.button.configure(state="normal")
@@ -350,12 +464,29 @@ class JarvisWindow:
         window.title("Настройки Джарвиса")
         window.resizable(False, False)
         window.transient(self.root)
-        frame = ttk.Frame(window, padding=18)
-        frame.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        frame = ttk.Frame(notebook, padding=18)
+        model_frame = ttk.Frame(notebook, padding=18)
+        notebook.add(frame, text="Основное")
+        notebook.add(model_frame, text="Модель и характер")
         city = tk.StringVar(value=self.settings.city)
         model = tk.StringVar(value=self.settings.model_path)
         chrome = tk.StringVar(value=self.settings.chrome_path)
         sound = tk.BooleanVar(value=self.settings.activation_sound)
+        llm_enabled = tk.BooleanVar(value=self.settings.llm_enabled)
+        llm_url = tk.StringVar(value=self.settings.llm_url)
+        llm_model = tk.StringVar(value=self.settings.llm_model)
+        llm_timeout = tk.StringVar(value=str(self.settings.llm_timeout))
+        ttk.Checkbutton(model_frame, text="Использовать локальную модель для свободных запросов", variable=llm_enabled).pack(anchor="w")
+        for label, variable in (("Адрес Ollama на этом компьютере", llm_url), ("Имя локальной модели", llm_model), ("Таймаут ответа, секунд (10–300)", llm_timeout)):
+            ttk.Label(model_frame, text=label).pack(anchor="w", pady=(10, 2))
+            ttk.Entry(model_frame, textvariable=variable, width=54).pack(fill="x")
+        ttk.Label(model_frame, text="Характер Джарвиса (до 3000 символов)").pack(anchor="w", pady=(12, 2))
+        personality = ScrolledText(model_frame, width=54, height=8, wrap="word", font=("Segoe UI", 10))
+        personality.pack(fill="both", expand=True)
+        personality.insert("1.0", self.settings.personality)
+        ttk.Label(model_frame, text="Для установки запусти setup-model.cmd. Модель работает локально.\nИзменения применяются сразу. Контекст — только текущий сеанс.", wraplength=430).pack(anchor="w", pady=12)
         for row, (label, variable) in enumerate((("Город для погоды", city), ("Папка модели Vosk", model), ("Путь к chrome.exe", chrome))):
             ttk.Label(frame, text=label).grid(row=row * 2, column=0, columnspan=2, sticky="w", pady=(6, 2))
             ttk.Entry(frame, textvariable=variable, width=51).grid(row=row * 2 + 1, column=0, sticky="ew")
@@ -390,18 +521,23 @@ class JarvisWindow:
         def save() -> None:
             try:
                 updated = replace(self.settings, city=city.get(), model_path=model.get(), chrome_path=chrome.get(),
-                                  microphone=devices[microphone.get()], activation_sound=sound.get())
+                                  microphone=devices[microphone.get()], activation_sound=sound.get(),
+                                  llm_enabled=llm_enabled.get(), llm_url=llm_url.get().strip(),
+                                  llm_model=llm_model.get().strip(), llm_timeout=int(llm_timeout.get()),
+                                  personality=personality.get("1.0", "end").strip())
                 save_settings(updated)
             except (ValueError, OSError) as exc:
                 messagebox.showerror("Настройки не сохранены", str(exc), parent=window)
                 return
             self.settings = updated
             self.assistant.city = updated.city
+            self._cancel_model()
+            self._conversation.clear()
             self.logger.info("Настройки сохранены в %s", CONFIG_PATH.name)
             window.destroy()
-            self.detail.set("Настройки сохранены. Для смены модели или микрофона перезапусти приложение.")
+            self._show_mode("Настройки сохранены. Только смена Vosk и микрофона требует перезапуска.")
 
-        ttk.Button(frame, text="Сохранить", command=save).grid(row=10, column=0, columnspan=2)
+        ttk.Button(window, text="Сохранить", command=save).pack(pady=(0, 12))
 
     def show_logs(self) -> None:
         if self._log_window and self._log_window.winfo_exists():
@@ -442,7 +578,7 @@ class JarvisWindow:
             for handler in self.logger.handlers:
                 handler.flush()
             with zipfile.ZipFile(selected, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path in sorted((ROOT / "logs").glob("jarvis.log*")):
+                for path in sorted([*(ROOT / "logs").glob("jarvis.log*"), *(ROOT / "logs").glob("ollama.log*")]):
                     archive.write(path, arcname=path.name)
             self.detail.set("Логи выгружены. В них есть распознанные команды и поисковые запросы.")
         except OSError as exc:
@@ -461,6 +597,7 @@ class JarvisWindow:
         self.ready = False
         self.assistant.sleep()
         self._cancel_jobs()
+        self.model_runtime.close()
         self._new_epoch()
         self.button.configure(state="disabled")
         self.status.set("Завершаю работу…")
